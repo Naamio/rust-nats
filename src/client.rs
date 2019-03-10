@@ -64,6 +64,7 @@ pub struct Client {
     verbose: bool,
     pedantic: bool,
     name: String,
+    io_timeout: Option<Duration>,
     state: Option<ClientState>,
     circuit_breaker: Option<Instant>,
     sid: u64,
@@ -169,6 +170,7 @@ impl Client {
             server_idx: 0,
             verbose: false,
             pedantic: false,
+            io_timeout: None,
             name: DEFAULT_NAME.to_owned(),
             state: None,
             sid: 1,
@@ -184,6 +186,11 @@ impl Client {
 
     pub fn set_name(&mut self, name: &str) {
         self.name = name.to_owned();
+    }
+
+    /// Set the overall timeout for each `TcpStream` connect, read or write.
+    pub fn set_io_timeout(&mut self, timeout: Option<Duration>) {
+        self.io_timeout = timeout;
     }
 
     pub fn set_tls_config(&mut self, config: TlsConfig) {
@@ -305,9 +312,18 @@ impl Client {
     }
 
     fn try_connect(&mut self) -> Result<(), NatsError> {
+        let timeout = self.io_timeout;
         let server_info = &mut self.servers_info[self.server_idx];
-        let stream_reader = TcpStream::connect((&server_info.host as &str, server_info.port))
-            .map(stream::Stream::Tcp)?;
+        let addr = format!("{}:{}", &server_info.host, server_info.port);
+        let stream_reader = match timeout {
+            Some(t) => TcpStream::connect_timeout(&addr.parse().expect("invalid addr"), t),
+            None => TcpStream::connect(&addr),
+        }.and_then(|stream| {
+            stream.set_read_timeout(timeout)?;
+            stream.set_write_timeout(timeout)?;
+            Ok(stream)
+        }).map(stream::Stream::Tcp)?;
+
         let mut stream_writer = stream_reader.try_clone()?;
         let mut buf_reader = BufReader::new(stream_reader);
         let mut line = String::new();
@@ -733,7 +749,7 @@ fn wait_read_msg(
             line.to_owned(),
         )));
     }
-    let line = line.trim_right();
+    let line = line.trim_end();
     let mut parts = line[4..].split(' ');
     let subject = parts.next().ok_or_else(|| {
         NatsError::from((
